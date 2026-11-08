@@ -148,7 +148,8 @@ class COCOSegmentDataset(Dataset):
 
     def __init__(self, data_dir, split="train", num_negatives=2,
                  generic_negatives=None, prompt_source="auto",
-                 mix_class_prompt=False, num_cross_negatives=2):
+                 mix_class_prompt=False, num_cross_negatives=2,
+                 per_instance_queries=False):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
@@ -172,6 +173,11 @@ class COCOSegmentDataset(Dataset):
                 prompt corpus exceeds MAX_ALWAYS_NEGATIVES distinct texts (which
                 is what happens with per-segment descriptions). Below that
                 threshold every absent prompt is used, as before.
+            per_instance_queries: Emit ONE query per instance instead of one
+                query per class. Each query then has exactly one target, so a
+                single box covering several same-class objects is no longer a
+                valid answer - this is what stops the model merging instances.
+                Costs more queries per image (borderline: identical texts).
         """
         if prompt_source not in PROMPT_SOURCES:
             raise ValueError(
@@ -185,6 +191,7 @@ class COCOSegmentDataset(Dataset):
         self.prompt_source = prompt_source
         self.mix_class_prompt = mix_class_prompt
         self.num_cross_negatives = num_cross_negatives
+        self.per_instance_queries = bool(per_instance_queries)
         self.generic_negatives = list(
             generic_negatives if generic_negatives is not None
             else self.DEFAULT_GENERIC_NEGATIVES
@@ -430,8 +437,21 @@ class COCOSegmentDataset(Dataset):
             if self.mix_class_prompt and class_name.lower() != prompt_text.lower():
                 class_to_object_ids[class_name.lower()].append(obj.object_id)
 
-        # Create one query per prompt
-        if len(class_to_object_ids) > 0:
+        # Create one query per prompt (default) or one per instance
+        if self.per_instance_queries and len(objects) > 0:
+            # Each prompt carries exactly one target object, so the detector
+            # cannot satisfy the loss with a single box spanning several
+            # same-class instances.
+            queries = []
+            for obj, prompt_text, class_name in zip(objects, object_prompts,
+                                                    object_class_names):
+                queries.append(make_query(prompt_text.lower(), [obj.object_id],
+                                          img_id, orig_h, orig_w))
+                if (self.mix_class_prompt
+                        and class_name.lower() != prompt_text.lower()):
+                    queries.append(make_query(class_name.lower(), [obj.object_id],
+                                              img_id, orig_h, orig_w))
+        elif len(class_to_object_ids) > 0:
             queries = [
                 make_query(query_text, obj_ids, img_id, orig_h, orig_w)
                 for query_text, obj_ids in class_to_object_ids.items()
@@ -492,6 +512,7 @@ def build_dataset(config, data_dir, split):
             prompt_source=training.get("prompt_source", "auto"),
             mix_class_prompt=training.get("mix_class_prompt", False),
             num_cross_negatives=num_cross_negatives,
+            per_instance_queries=training.get("per_instance_queries", False),
         )
 
     if data_format == "odvg":
@@ -981,6 +1002,18 @@ class SAM3TrainerNative:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Mixed precision - ON by default (bf16), matching the official SAM3
+        # trainer (optim.amp.amp_dtype: bfloat16). "fp16" adds a GradScaler,
+        # "none"/"fp32" restores full-precision training.
+        mp = str(self.config.get("training", {}).get("mixed_precision", "bf16")).lower()
+        self.amp_dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16,
+                          "fp16": torch.float16, "float16": torch.float16}.get(mp)
+        self.amp_enabled = self.amp_dtype is not None and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.amp_enabled and self.amp_dtype == torch.float16
+        )
+        print_rank0(f"Mixed precision: {mp if self.amp_enabled else 'fp32 (off)'}")
+
         # Build Model
         print_rank0("Building SAM3 model...")
         self.model = build_sam3_image_model(
@@ -1068,11 +1101,16 @@ class SAM3TrainerNative:
             )
         ]
 
-        # Create one-to-many matcher for auxiliary outputs
+        # One-to-many auxiliary matching. Each extra query per GT is an extra
+        # licence to cover the same object with a coarser box, so topk=1 keeps
+        # the auxiliary branch but removes the duplicate-matching incentive.
+        o2m_topk = int(self.config.get("training", {}).get("o2m_topk", 4))
+        o2m_weight = float(self.config.get("training", {}).get("o2m_weight", 2.0))
+        print_rank0(f"One-to-many matching: topk={o2m_topk}, weight={o2m_weight}")
         o2m_matcher = BinaryOneToManyMatcher(
             alpha=0.3,
             threshold=0.4,
-            topk=4
+            topk=o2m_topk
         )
 
         # Use Sam3LossWrapper for proper loss computation
@@ -1080,12 +1118,18 @@ class SAM3TrainerNative:
             loss_fns_find=loss_fns,
             matcher=self.matcher,
             o2m_matcher=o2m_matcher,
-            o2m_weight=2.0,
+            o2m_weight=o2m_weight,
             use_o2m_matcher_on_o2m_aux=False,
             normalization="local",  # Use local normalization (no distributed training)
             normalize_by_valid_object_num=False,
         )
         
+    def _amp_autocast(self):
+        """bf16/fp16 autocast around forward + loss, like sam3/train/trainer.py."""
+        if not self.amp_enabled:
+            return contextlib.nullcontext()
+        return torch.amp.autocast(device_type="cuda", dtype=self.amp_dtype)
+
     def train(self):
         # Get data directory from config (should point to directory containing train/valid folders)
         data_dir = self.config["training"]["data_dir"]
@@ -1231,48 +1275,50 @@ class SAM3TrainerNative:
                 # Move to device
                 input_batch = move_to_device(input_batch, self.device)
 
-                # Forward pass
-                # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
-                outputs_list = self.model(input_batch)
+                # Forward + matching + loss under autocast (bf16 by default)
+                with self._amp_autocast():
+                    # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
+                    outputs_list = self.model(input_batch)
 
-                # Prepare targets for loss
-                # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
-                find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                    # Prepare targets for loss
+                    # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
+                    find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
-                # Move targets to device
-                for targets in find_targets:
-                    for k, v in targets.items():
-                        if isinstance(v, torch.Tensor):
-                            targets[k] = v.to(self.device)
+                    # Move targets to device
+                    for targets in find_targets:
+                        for k, v in targets.items():
+                            if isinstance(v, torch.Tensor):
+                                targets[k] = v.to(self.device)
 
-                # Add matcher indices to outputs (required by Sam3LossWrapper)
-                # Use SAM3Output.iteration_mode to properly iterate over outputs
-                with SAM3Output.iteration_mode(
-                    outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                ) as outputs_iter:
-                    for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                        # stage_targets is a single target dict, replicate for all steps
-                        stage_targets_list = [stage_targets] * len(stage_outputs)
-                        for outputs, targets in zip(stage_outputs, stage_targets_list):
-                            # Compute indices for main output
-                            outputs["indices"] = self.matcher(outputs, targets)
+                    # Add matcher indices to outputs (required by Sam3LossWrapper)
+                    # Use SAM3Output.iteration_mode to properly iterate over outputs
+                    with SAM3Output.iteration_mode(
+                        outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                    ) as outputs_iter:
+                        for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                            # stage_targets is a single target dict, replicate for all steps
+                            stage_targets_list = [stage_targets] * len(stage_outputs)
+                            for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                # Compute indices for main output
+                                outputs["indices"] = self.matcher(outputs, targets)
 
-                            # Also add indices to auxiliary outputs if they exist
-                            if "aux_outputs" in outputs:
-                                for aux_out in outputs["aux_outputs"]:
-                                    aux_out["indices"] = self.matcher(aux_out, targets)
+                                # Also add indices to auxiliary outputs if they exist
+                                if "aux_outputs" in outputs:
+                                    for aux_out in outputs["aux_outputs"]:
+                                        aux_out["indices"] = self.matcher(aux_out, targets)
 
-                # Compute loss using Sam3LossWrapper
-                # This handles num_boxes calculation and proper weighting
-                loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                    # Compute loss using Sam3LossWrapper
+                    # This handles num_boxes calculation and proper weighting
+                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
-                # Extract total loss
-                total_loss = loss_dict[CORE_LOSS_KEY]
+                    # Extract total loss
+                    total_loss = loss_dict[CORE_LOSS_KEY]
 
                 # Backward
                 self.optimizer.zero_grad()
-                total_loss.backward()
-                self.optimizer.step()
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 # Track training loss
                 train_losses.append(total_loss.item())
@@ -1293,33 +1339,34 @@ class SAM3TrainerNative:
                         input_batch = batch_dict["input"]
                         input_batch = move_to_device(input_batch, self.device)
 
-                        # Forward pass
-                        outputs_list = self.model(input_batch)
+                        # Forward + matching + loss under autocast
+                        with self._amp_autocast():
+                            outputs_list = self.model(input_batch)
 
-                        # Prepare targets
-                        find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+                            # Prepare targets
+                            find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
 
-                        # Move targets to device
-                        for targets in find_targets:
-                            for k, v in targets.items():
-                                if isinstance(v, torch.Tensor):
-                                    targets[k] = v.to(self.device)
+                            # Move targets to device
+                            for targets in find_targets:
+                                for k, v in targets.items():
+                                    if isinstance(v, torch.Tensor):
+                                        targets[k] = v.to(self.device)
 
-                        # Add matcher indices to outputs (required by Sam3LossWrapper)
-                        with SAM3Output.iteration_mode(
-                            outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-                        ) as outputs_iter:
-                            for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
-                                stage_targets_list = [stage_targets] * len(stage_outputs)
-                                for outputs, targets in zip(stage_outputs, stage_targets_list):
-                                    outputs["indices"] = self.matcher(outputs, targets)
-                                    if "aux_outputs" in outputs:
-                                        for aux_out in outputs["aux_outputs"]:
-                                            aux_out["indices"] = self.matcher(aux_out, targets)
+                            # Add matcher indices to outputs (required by Sam3LossWrapper)
+                            with SAM3Output.iteration_mode(
+                                outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+                            ) as outputs_iter:
+                                for stage_outputs, stage_targets in zip(outputs_iter, find_targets):
+                                    stage_targets_list = [stage_targets] * len(stage_outputs)
+                                    for outputs, targets in zip(stage_outputs, stage_targets_list):
+                                        outputs["indices"] = self.matcher(outputs, targets)
+                                        if "aux_outputs" in outputs:
+                                            for aux_out in outputs["aux_outputs"]:
+                                                aux_out["indices"] = self.matcher(aux_out, targets)
 
-                        # Compute loss using Sam3LossWrapper
-                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
-                        total_loss = loss_dict[CORE_LOSS_KEY]
+                            # Compute loss using Sam3LossWrapper
+                            loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                            total_loss = loss_dict[CORE_LOSS_KEY]
 
                         val_losses.append(total_loss.item())
                         val_pbar.set_postfix({"val_loss": total_loss.item()})
