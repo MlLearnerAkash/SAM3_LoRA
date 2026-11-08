@@ -21,6 +21,13 @@ Fine-tune SAM3 (Segment Anything Model 3) on your own dataset using **LoRA (Low-
 
 ### Recent Updates
 
+**2026-11-07**:
+- **bf16 mixed precision is now on by default** — the native trainer wraps the forward, matching and loss in `torch.amp.autocast`, exactly like SAM3's own trainer (`optim.amp.amp_dtype: bfloat16`). Set `training.mixed_precision` to `bf16` (default), `fp16` (adds a `GradScaler`) or `none` for full fp32. Measured on a 32 GB RTX 5090 at 1008 px, batch 2 with the segmentation head: **22.6 GiB in bf16 vs >30 GiB (OOM) in fp32**
+- **Fixed the CUDA OOM that was not batch-size related** — `MultiheadAttentionLoRA` in `lora_layers.py` computed attention by hand (`q @ kᵀ` → softmax), materialising the full `[B, heads, 5184, 5184]` score matrix (~16 GiB at 1008 px). It now uses `F.scaled_dot_product_attention` whenever `need_weights=False`; numerically identical, gradients unchanged, and the manual path is kept for calls that ask for attention weights
+- **Gradient accumulation actually works now** — `training.gradient_accumulation_steps` was silently ignored (an optimizer step happened every batch). Steps now accumulate and the loss is scaled by the accumulation count, so `batch_size: 1` + `gradient_accumulation_steps: 16` keeps the same effective batch at 12.3 GiB peak
+- **New: `convert_labelme_to_coco.py`** — turns a folder of LabelMe `<image>.json` files into the `<data_dir>/<split>/_annotations.coco.json` layout the trainers expect. Polygons, rectangles, circles, rings and lines become polygon segmentations; images are hard-linked (default), symlinked or copied; train/valid/test split ratios are configurable. Ids are written **0-based and contiguous**, because the loaders index the dataset positionally while SAM3's query metadata carries `original_image_id` — a 1-based export makes validation read the wrong image and overrun the last index. `--descriptions classes.json` writes a `_descriptions.json` sidecar, so you can train on descriptions while LabelMe keeps exporting class names
+- **New: instance-separation options** — `training.per_instance_queries: true` emits **one query per instance** instead of one per class, so a single box spanning several same-class objects is no longer a valid answer; `training.o2m_topk` / `training.o2m_weight` expose the one-to-many auxiliary matcher (previously hard-coded to `topk=4`, `weight=2.0`). Lowering `o2m_topk` to `1` removes the duplicate-match licence behind merged/union boxes. Ablation on this dataset (`pred/gt` per class, 40 valid images): stock SAM3 `1.68–2.54`, full LoRA `1.78` with `clamp 0.25` (merging), frozen vision encoder `1.68` with `clamp 1.96` (no merging) — so the union-box behaviour was driven by vision-backbone LoRA specifically
+
 **2026-08-23 (v0.4.0)**:
 - **Train on descriptions, not just class names** — the text prompt no longer has to be the COCO category name. Two data formats, selected with `training.data_format`:
   - `coco` (default) — the same `_annotations.coco.json` you already have, now resolving prompts from `annotation["caption"]` (per **segment**) → `image["caption"]` (per **image**) → `category["description"]` (per **class**, RF100-VL style) → `category["name"]`. An unmodified export behaves exactly as before. Descriptions may also live in a `_descriptions.json` sidecar so Roboflow re-exports never overwrite them. `prompt_source` forces one level; `mix_class_prompt` trains the bare class name as a second prompt alongside the description
@@ -240,6 +247,31 @@ data/
 **Supported Segmentation Formats:**
 - **Polygon**: `"segmentation": [[x1, y1, x2, y2, ...]]` (list of polygons)
 - **RLE**: `"segmentation": {"counts": "...", "size": [h, w]}` (run-length encoded)
+
+**Coming from LabelMe?** Convert your `<image>.json` files directly:
+
+```bash
+# 90/10 train/valid split, images hard-linked (no disk duplication)
+python3 convert_labelme_to_coco.py \
+    --src /data/dataset/my_labelme_dir \
+    --out /data/dataset/my_coco_dir
+
+# explicit ratios, extra test split, and per-class prompt texts
+python3 convert_labelme_to_coco.py --src ... --out ... \
+    --valid-frac 0.1 --test-frac 0.05 \
+    --descriptions classes.json
+```
+
+Each LabelMe shape becomes one annotation under the category named by its
+`label` (`polygon`, `rectangle`, `circle`, `ring`, `line`/`linestrip` are all
+supported; points are skipped). Annotations are written **0-based and
+contiguous** — the loaders index the dataset positionally while SAM3 query
+metadata carries `original_image_id`, so a 1-based export would make
+`validate_sam3_lora.py` read the wrong image and overrun the last index. The
+converter asserts this before writing. `--link-mode hardlink|symlink|copy`
+controls how images are staged, `--drop-empty` skips images without shapes, and
+`--recursive` scans subdirectories (existing `coco_format*/` and `wandb/`
+directories are skipped).
 
 **Using RefCOCO-format datasets (RefCOCO, RRSIS-D, ...):** referring-expression
 datasets ship as `instances.json` + a `refs(*).p` pickle instead of per-split
@@ -629,6 +661,11 @@ All under `training:` in your YAML config.
 | `num_cross_negatives` | `2` | both | In-domain negatives sampled per image once the corpus exceeds 50 distinct prompts |
 | `num_negatives` | `2` | both | Generic out-of-domain negatives sampled per image |
 | `generic_negatives` | built-in pool | both | Replace the out-of-domain pool |
+| `per_instance_queries` | `false` | coco | One query **per instance** instead of per class, so a merged box cannot satisfy the loss |
+| `o2m_topk` | `4` | both | One-to-many auxiliary matcher: extra queries allowed to cover the same GT. `1` removes the duplicate/union-box incentive |
+| `o2m_weight` | `2.0` | both | Weight of the auxiliary one-to-many loss (raised on top of the one-to-one term); `0.0` disables it |
+| `mixed_precision` | `"bf16"` | both | `bf16` (default, no scaler), `fp16` (GradScaler), `none`/`fp32` |
+| `gradient_accumulation_steps` | `1` | both | Batches per optimizer step; loss is divided by this value. `batch_size: 1` + `16` = effective batch 16 |
 
 </details>
 
@@ -1912,6 +1949,7 @@ SAM3_LoRA/
 ├── infer_sam.py                   # Inference script (recommended)
 ├── inference_lora.py              # Legacy inference script
 ├── merge_lora_weights.py          # Fold a trained adapter into the base weights
+├── convert_labelme_to_coco.py     # LabelMe json -> COCO split layout
 ├── convert_refcoco_to_coco.py     # RefCOCO/RRSIS-D -> COCO layout converter
 ├── convert_coco_to_odvg.py        # COCO/Roboflow -> ODVG jsonl converter
 ├── README_INFERENCE.md            # Detailed inference guide
