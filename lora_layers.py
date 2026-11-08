@@ -105,47 +105,67 @@ class MultiheadAttentionLoRA(nn.Module):
         k = k.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Scaled dot-product attention
+        # ---- Normalise masks once, for both the fast and the manual path ----
+        # This module treats True in a bool mask as "masked out".
+        mask = attn_mask
+        if mask is not None:
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(0).unsqueeze(0)          # (1, 1, L, S)
+            elif mask.dim() == 3:
+                if mask.shape[0] == batch_size:
+                    mask = mask.unsqueeze(1)                    # (B, 1, L, S)
+                elif mask.shape[0] == batch_size * self.num_heads:
+                    mask = mask.view(batch_size, self.num_heads, tgt_len, src_len)
+                else:
+                    mask = mask.unsqueeze(1)
+            # dim 4: already (B, H, L, S)
+
+        if key_padding_mask is not None:
+            kpm = key_padding_mask
+            if kpm.dtype != torch.bool:
+                kpm = kpm.to(torch.bool)
+            kpm = kpm.view(batch_size, 1, 1, src_len)
+            if mask is None:
+                mask = kpm.expand(batch_size, 1, tgt_len, src_len)
+            elif mask.dtype == torch.bool:
+                mask = mask | kpm
+            else:
+                mask = mask + torch.zeros_like(kpm, dtype=mask.dtype).masked_fill(
+                    kpm, float("-inf"))
+
+        # ---- Fast path: fused / memory-efficient attention ----
+        # The manual path below materialises the full (B, H, L, S) score matrix.
+        # At 1008px that is 72*72 = 5184 tokens, i.e. ~16 GiB per attention call,
+        # and it is exactly what OOMs the image model. SDPA uses flash /
+        # mem-efficient kernels and never writes that matrix.
+        if not need_weights:
+            sdpa_mask = None
+            if mask is not None:
+                sdpa_mask = ~mask if mask.dtype == torch.bool else mask
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=sdpa_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=bool(is_causal) and sdpa_mask is None,
+            )
+            attn_output = attn_output.transpose(1, 2).contiguous().view(
+                batch_size, tgt_len, self.embed_dim)
+            attn_output = self.out_proj(attn_output)
+            if not self.batch_first:
+                attn_output = attn_output.transpose(0, 1)
+            return attn_output, None
+
+        # ---- Manual path (only when attention weights are requested) ----
         scale = 1.0 / math.sqrt(self.head_dim)
         attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
 
-        # Apply attention mask - handle various input formats
-        if attn_mask is not None:
-            # attn_weights shape: (batch, num_heads, tgt_len, src_len)
-            if attn_mask.dim() == 2:
-                # (tgt_len, src_len) -> (1, 1, tgt_len, src_len)
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-            elif attn_mask.dim() == 3:
-                # Could be (batch, tgt_len, src_len) or (batch*num_heads, tgt_len, src_len)
-                if attn_mask.shape[0] == batch_size:
-                    # (batch, tgt_len, src_len) -> (batch, 1, tgt_len, src_len)
-                    attn_mask = attn_mask.unsqueeze(1)
-                elif attn_mask.shape[0] == batch_size * self.num_heads:
-                    # (batch*num_heads, tgt_len, src_len) -> (batch, num_heads, tgt_len, src_len)
-                    attn_mask = attn_mask.view(batch_size, self.num_heads, tgt_len, src_len)
-                else:
-                    # Unknown format, try to broadcast
-                    attn_mask = attn_mask.unsqueeze(1)
-            elif attn_mask.dim() == 4:
-                # Already (batch, num_heads, tgt_len, src_len) or similar
-                pass
-
-            # Expand to match attn_weights if needed
-            if attn_mask.shape != attn_weights.shape:
-                attn_mask = attn_mask.expand_as(attn_weights)
-
-            if attn_mask.dtype == torch.bool:
-                attn_weights = attn_weights.masked_fill(attn_mask, float('-inf'))
+        if mask is not None:
+            if mask.shape != attn_weights.shape:
+                mask = mask.expand_as(attn_weights)
+            if mask.dtype == torch.bool:
+                attn_weights = attn_weights.masked_fill(mask, float('-inf'))
             else:
-                attn_weights = attn_weights + attn_mask
-
-        # Apply key padding mask
-        if key_padding_mask is not None:
-            # key_padding_mask: (batch, src_len), True = ignore
-            attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2),
-                float('-inf')
-            )
+                attn_weights = attn_weights + mask
 
         # Softmax and dropout
         attn_weights = F.softmax(attn_weights, dim=-1)
