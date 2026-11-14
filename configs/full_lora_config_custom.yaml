@@ -62,8 +62,7 @@ lora:
 
 # Training settings
 training:
-  # Converted from LabelMe with convert_labelme_to_coco.py:
-  #   train 1903 imgs / 6160 anns, valid 212 imgs / 718 anns
+  #   train 2126 imgs / 6805 anns, valid 237 imgs / 800 anns  (90.0 / 10.0)
   #   7 classes: clamp, forceps, gauze, needle, needle_holder, scissors, sponge
   data_dir: "/data/dataset/sam3_train_coco"  # contains train/ and valid/ with _annotations.coco.json
   batch_size: 2      # 1008px images on a 32GB RTX 5090; raise to 4 if VRAM allows
@@ -129,7 +128,7 @@ training:
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 10       # ~950 steps/epoch at batch 2 x 1903 images
+  num_epochs: 10       # ~1063 steps/epoch at batch 2 x 2126 images
   warmup_steps: 200     # Reduced from 1000 (proportional to dataset size)
   lr_scheduler: "cosine"
 
@@ -143,7 +142,7 @@ training:
   gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
 
 output:
-  output_dir: "outputs/sam3_lora_surgical_instruments/frozen_vision_encode_ep10_202611081"
+  output_dir: "outputs/sam3_lora_surgical_instruments/frozen_vision_encode_ep10_needle_crop_202611121"
   logging_dir: "logs"
   save_lora_only: true
   push_to_hub: false
