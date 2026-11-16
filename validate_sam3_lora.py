@@ -84,7 +84,7 @@ class COCOSegmentDataset(Dataset):
 
         used_cat_ids = {ann.get('category_id') for ann in self.coco_data['annotations']}
         self.eval_prompt_categories = [
-            (self.categories[cid].lower(), int(cid))
+            (self.categories[cid].lower().replace("_", " "), int(cid))
             for cid in sorted(c for c in used_cat_ids if c in self.categories)
         ]
 
@@ -221,7 +221,7 @@ class COCOSegmentDataset(Dataset):
         prompt_to_category_id = {}
         for obj, class_name, category_id in zip(objects, object_class_names,
                                                 object_class_ids):
-            key = class_name.lower()
+            key = class_name.lower().replace("_", " ")
             class_to_object_ids[key].append(obj.object_id)
             prompt_to_category_id[key] = int(category_id)
 
@@ -1350,13 +1350,21 @@ def save_class_overlays(dataset, predictions, gt_dict, classes, out_dir,
         green  -> TP  (prediction matched to a same-class GT at IoU >= thr)
         red    -> FN  (GT with no matching prediction; label carries class name)
         yellow -> FP  (prediction with no matching GT; label carries class name)
+        magenta -> GT box drawn for context on the overkill images
+
+    Images are split by error type:
+        <out_dir>/<class>/overkill/   images that contain FP detections
+                                     (GT boxes of the class are drawn too)
+        <out_dir>/<class>/underkill/  images with missed GT (FN)
 
     Args:
         dataset: validation dataset (used for original image paths/sizes).
         predictions: COCO predictions with real category ids (288-res coords).
         gt_dict: COCO GT with real category ids (288-res coords, per image).
         classes: iterable of class names to render (case-insensitive).
-        out_dir: root directory; each class gets its own subfolder.
+        out_dir: root directory; each class gets its own subfolder, which in
+            turn holds `overkill/` (false positives) and `underkill/`
+            (false negatives) image folders.
         iou_threshold: box IoU used to match prediction <-> GT.
         resolution: coordinate space of the COCO boxes (288 by default).
         max_images: optional cap per class (debug).
@@ -1402,10 +1410,13 @@ def save_class_overlays(dataset, predictions, gt_dict, classes, out_dir,
     color_tp = (0, 170, 60)
     color_fn = (220, 20, 20)
     color_fp = (235, 200, 0)
+    color_gt = (230, 0, 200)
 
     for name, cid in targets:
-        class_dir = out_dir / name
-        class_dir.mkdir(parents=True, exist_ok=True)
+        over_dir = out_dir / name / "overkill"      # false positives
+        under_dir = out_dir / name / "underkill"    # false negatives
+        over_dir.mkdir(parents=True, exist_ok=True)
+        under_dir.mkdir(parents=True, exist_ok=True)
         n_saved = 0
 
         for img in gt_dict['images']:
@@ -1433,63 +1444,435 @@ def save_class_overlays(dataset, predictions, gt_dict, classes, out_dir,
 
             img_info = dataset.images[dataset.image_ids[src_idx]]
             img_path = dataset.split_dir / img_info['file_name']
-            try:
-                pil_img = PILImage.open(img_path).convert("RGB")
-            except Exception as e:
-                print(f"[WARN] Cannot open {img_path}: {e}")
-                continue
 
-            ow, oh = pil_img.size
+            ow, oh = img_info['width'], img_info['height']
             sx, sy = ow / resolution, oh / resolution
 
             def _scale(box):
                 x, y, w, h = box
                 return [x * sx, y * sy, (x + w) * sx, (y + h) * sy]
 
-            draw = ImageDraw.Draw(pil_img)
-            try:
-                font = ImageFont.load_default()
-            except Exception:
-                font = None
+            fp_idx = [pi for pi in range(len(preds)) if pi not in matched_pred]
+            fn_idx = [gi for gi in range(len(gts)) if gi not in matched_gt]
+            stats[name]['fp'] += len(fp_idx)
+            stats[name]['fn'] += len(fn_idx)
+            stats[name]['tp'] += len(matched_gt)
 
-            def _label(box, text, color):
-                x1, y1, _, _ = box
-                ty = max(0, y1 - 12)
-                draw.text((x1 + 2, ty), text, fill=color, font=font)
+            stem = Path(img_info['file_name']).stem
 
-            for gi, g in enumerate(gts):
-                box = _scale(g['bbox'])
-                if gi in matched_gt:
-                    draw.rectangle(box, outline=color_tp, width=3)
-                    _label(box, f"{name} TP", color_tp)
-                    stats[name]['tp'] += 1
-                else:
-                    draw.rectangle(box, outline=color_fn, width=3)
-                    _label(box, f"{name} FN", color_fn)
-                    stats[name]['fn'] += 1
+            def _open():
+                try:
+                    return PILImage.open(img_path).convert("RGB")
+                except Exception as e:
+                    print(f"[WARN] Cannot open {img_path}: {e}")
+                    return None
 
-            for pi, p in enumerate(preds):
-                if pi in matched_pred:
-                    continue
-                box = _scale(p['bbox'])
-                draw.rectangle(box, outline=color_fp, width=3)
-                _label(box, f"{name} FP", color_fp)
-                stats[name]['fp'] += 1
+            def _draw_base(pil_img):
+                d = ImageDraw.Draw(pil_img)
+                try:
+                    f = ImageFont.load_default()
+                except Exception:
+                    f = None
 
-            out_path = class_dir / f"{Path(img_info['file_name']).stem}.png"
-            pil_img.save(out_path)
-            stats[name]['images'] += 1
+                def _label(box, text, color):
+                    d.text((box[0] + 2, max(0, box[1] - 12)), text,
+                           fill=color, font=f)
+                return d, _label
+
+            # --- overkill: false positives; GT of this class drawn for context
+            if fp_idx:
+                pil_img = _open()
+                if pil_img is not None:
+                    draw, _label = _draw_base(pil_img)
+                    for g in gts:
+                        box = _scale(g['bbox'])
+                        draw.rectangle(box, outline=color_gt, width=3)
+                        _label(box, f"{name} GT", color_gt)
+                    for pi in fp_idx:
+                        box = _scale(preds[pi]['bbox'])
+                        draw.rectangle(box, outline=color_fp, width=3)
+                        _label(box, f"{name} FP", color_fp)
+                    pil_img.save(over_dir / f"{stem}.png")
+                    stats[name]['images'] += 1
+
+            # --- underkill: false negatives (missed GT)
+            if fn_idx:
+                pil_img = _open()
+                if pil_img is not None:
+                    draw, _label = _draw_base(pil_img)
+                    for gi, g in enumerate(gts):
+                        box = _scale(g['bbox'])
+                        if gi in fn_idx:
+                            draw.rectangle(box, outline=color_fn, width=3)
+                            _label(box, f"{name} FN", color_fn)
+                        else:
+                            draw.rectangle(box, outline=color_tp, width=3)
+                            _label(box, f"{name} TP", color_tp)
+                    for pi, p in enumerate(preds):
+                        if pi in matched_pred:
+                            continue
+                        box = _scale(p['bbox'])
+                        draw.rectangle(box, outline=color_fp, width=1)
+                    pil_img.save(under_dir / f"{stem}.png")
+                    stats[name]['images'] += 1
+
             n_saved += 1
             if max_images and n_saved >= max_images:
                 break
 
-        print(f"[INFO] Overlays '{name}': {n_saved} images -> {class_dir} "
+        print(f"[INFO] Overlays '{name}': overkill={over_dir} "
+              f"({len(list(over_dir.glob('*.png')))} imgs), underkill={under_dir} "
+              f"({len(list(under_dir.glob('*.png')))} imgs) "
               f"(TP={stats[name]['tp']} FP={stats[name]['fp']} "
               f"FN={stats[name]['fn']})")
 
-    print(f"[INFO] Overlay colour code: green=TP, red=FN (GT), yellow=FP (pred)")
+    print("[INFO] Overlay colour code: green=TP, red=FN (GT), yellow=FP (pred), "
+          "magenta=GT on overkill")
 
     return stats
+
+
+def _norm_prompt(s):
+    """Case/space-insensitive prompt key ('needle holder' == 'needle_holder')."""
+    return str(s).lower().replace(" ", "_")
+
+
+def _make_inference_datapoint(pil_image, prompts, transform, resolution=1008,
+                              src_idx=-1, coco_image_id=-1, orig_size=None):
+    """Single-image Datapoint carrying text prompts only (no GT objects)."""
+    resized = pil_image.resize((resolution, resolution), PILImage.BILINEAR)
+    tensor = transform(resized)
+    orig_h, orig_w = orig_size if orig_size else (pil_image.size[1], pil_image.size[0])
+    queries = [
+        FindQueryLoaded(
+            query_text=text, image_id=0, object_ids_output=[], is_exhaustive=True,
+            query_processing_order=0,
+            inference_metadata=InferenceMetadata(
+                coco_image_id=coco_image_id, original_image_id=src_idx,
+                original_category_id=int(cat_id), original_size=(orig_h, orig_w),
+                object_id=-1, frame_index=-1))
+        for text, cat_id in prompts
+    ]
+    return Datapoint(find_queries=queries,
+                     images=[Image(data=tensor, objects=[],
+                                   size=(resolution, resolution))],
+                     raw_images=[resized])
+
+
+def _forward_datapoint(model, dp, device, use_amp):
+    """Forward one datapoint; returns (final_outputs, obj_ids_per_prompt)."""
+    batch = collate_fn_api([dp], dict_key="input", with_seg_masks=True)["input"]
+    batch = move_to_device(batch, device)
+    if use_amp:
+        with torch.cuda.amp.autocast():
+            outs = model(batch)
+    else:
+        outs = model(batch)
+    with SAM3Output.iteration_mode(
+            outs, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE) as it:
+        final_outputs = list(it)[-1][-1]
+    n = int(final_outputs['pred_logits'].shape[0])
+    num_boxes = batch.find_targets[0].num_boxes
+    obj_padded = batch.find_targets[0].object_ids_padded
+    obj_ids = [[] if int(num_boxes[i]) <= 0 else
+               [int(o) for o in obj_padded[i][:int(num_boxes[i])].tolist()]
+               for i in range(n)]
+    return final_outputs, obj_ids
+
+
+def _remap_crop_output(outputs, i, crop_box, img_size, grid=288):
+    """Move one crop-prompt prediction from crop space into full-image space."""
+    x0, y0, x1, y1 = crop_box
+    W, H = img_size
+    cw, ch = max(x1 - x0, 1), max(y1 - y0, 1)
+
+    boxes = outputs['pred_boxes'][i].detach().float().cpu().clone()
+    boxes[:, 0] = (x0 + boxes[:, 0] * cw) / W
+    boxes[:, 1] = (y0 + boxes[:, 1] * ch) / H
+    boxes[:, 2] = boxes[:, 2] * cw / W
+    boxes[:, 3] = boxes[:, 3] * ch / H
+
+    masks = outputs['pred_masks'][i].detach().float().cpu()
+    gw = max(1, min(grid, int(round(cw / W * grid))))
+    gh = max(1, min(grid, int(round(ch / H * grid))))
+    ox = max(0, min(grid - gw, int(round(x0 / W * grid))))
+    oy = max(0, min(grid - gh, int(round(y0 / H * grid))))
+    resized = torch.nn.functional.interpolate(
+        masks.unsqueeze(1), size=(gh, gw), mode='bilinear',
+        align_corners=False).squeeze(1)
+    canvas = torch.full((masks.shape[0], grid, grid), -20.0, dtype=torch.float32)
+    canvas[:, oy:oy + gh, ox:ox + gw] = resized
+
+    out = {'pred_logits': outputs['pred_logits'][i].detach().float().cpu(),
+           'pred_boxes': boxes, 'pred_masks': canvas}
+    if 'presence_logit_dec' in outputs:
+        out['presence_logit'] = outputs['presence_logit_dec'][i].detach().float().cpu()
+    return out
+
+
+def collect_single_stage_predictions(model, val_loader, device, use_amp,
+                                     batch_size, num_samples=None):
+    """Original batched pass over the dataloader (one stage, full images)."""
+    all_predictions = []
+    all_image_ids = []
+    all_eval_units = []
+
+    for batch_idx, batch_dict in enumerate(tqdm(val_loader, desc="Validation")):
+        if num_samples and batch_idx * batch_size >= num_samples:
+            break
+
+        input_batch = batch_dict["input"]
+        input_batch = move_to_device(input_batch, device)
+
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                outputs_list = model(input_batch)
+        else:
+            outputs_list = model(input_batch)
+
+        with SAM3Output.iteration_mode(
+                outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
+        ) as outputs_iter:
+            final_stage = list(outputs_iter)[-1]
+            final_outputs = final_stage[-1]
+
+            num_prompts = final_outputs['pred_logits'].shape[0]
+            meta = input_batch.find_metadatas[0]
+            tgt = input_batch.find_targets[0]
+            src_img_ids = meta.original_image_id
+            src_cat_ids = meta.original_category_id
+            num_boxes = tgt.num_boxes
+            obj_ids_padded = tgt.object_ids_padded
+
+            for i in range(num_prompts):
+                eval_id = len(all_predictions)
+                src_idx = int(src_img_ids[i])
+                category_id = int(src_cat_ids[i])
+                n = int(num_boxes[i])
+                obj_ids = [int(o) for o in obj_ids_padded[i][:n].tolist()] if n > 0 else []
+
+                all_image_ids.append(eval_id)
+                all_eval_units.append({
+                    'eval_id': eval_id,
+                    'src_idx': src_idx,
+                    'category_id': category_id,
+                    'obj_ids': obj_ids,
+                })
+                pred_entry = {
+                    'category_id': category_id,
+                    'pred_logits': final_outputs['pred_logits'][i].detach().cpu(),
+                    'pred_boxes': final_outputs['pred_boxes'][i].detach().cpu(),
+                    'pred_masks': final_outputs['pred_masks'][i].detach().cpu()
+                }
+                if 'presence_logit_dec' in final_outputs:
+                    pred_entry['presence_logit'] = (
+                        final_outputs['presence_logit_dec'][i].detach().cpu()
+                    )
+                all_predictions.append(pred_entry)
+
+    return all_predictions, all_eval_units, all_image_ids
+
+
+def collect_two_stage_predictions(model, val_ds, device, use_amp,
+                                  exclude_prompts=("needle",
+                                                   "needle hook"),
+                                  crop_prompts=("needle", "needle hook"),
+                                  peak_prompt="needle hook",
+                                  crop_size=768, top_k=2, viz_dir=None,
+                                  gt_prompt="needle", max_images=None):
+    """
+    Two-stage inference, run per image on the fly.
+
+    Stage 1: whole image through every prompt EXCEPT `exclude_prompts`
+             (needle, needle holder, needle hook).
+    Stage 2: the union of the top-`top_k` peak crops of the `peak_prompt`
+             ('needle hook') attention map is re-run with `crop_prompts`
+             ('needle' and 'needle hook' — equivalent, both scored as needle).
+             Results are mapped back into full-image coordinates so both stages
+             merge seamlessly.
+
+    A 'needle hook' query is injected into the full-image datapoint (the COCO
+    split only knows the name needle_holder) so its attention can be used for
+    the peak windows.
+
+    Returns (predictions, eval_units) in the same format as the one-stage loop.
+    viz_dir: if set, the full image with the crop union (+ needle GT) drawn is
+             saved there instead of the bare crop.
+    """
+    import copy
+    from PIL import ImageDraw
+
+    exclude = {_norm_prompt(p) for p in exclude_prompts}
+    cat_by_name = {_norm_prompt(n): int(c) for c, n in val_ds.categories.items()}
+    gt_cid = cat_by_name.get(_norm_prompt(gt_prompt), -1)
+    # Both needle prompts are scored as the needle class (they mean the same
+    # object); 'needle hook' is not a COCO category name.
+    crop_specs = [(p, gt_cid) for p in crop_prompts]
+    hook_text = peak_prompt if _norm_prompt(peak_prompt) not in cat_by_name else None
+
+    if viz_dir is not None:
+        viz_dir = Path(viz_dir)
+        viz_dir.mkdir(parents=True, exist_ok=True)
+
+    all_predictions, all_eval_units = [], []
+    n_crop_units = n_viz = 0
+    gt_total = gt_inside = 0
+
+    n_imgs = len(val_ds) if not max_images else min(len(val_ds), int(max_images))
+    for src_idx in tqdm(range(n_imgs), desc="Validation (two-stage)"):
+        dp = val_ds[src_idx]
+        if hook_text is not None:
+            meta0 = dp.find_queries[0].inference_metadata
+            extra = FindQueryLoaded(
+                query_text=hook_text, image_id=0, object_ids_output=[],
+                is_exhaustive=True, query_processing_order=0,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=meta0.coco_image_id,
+                    original_image_id=src_idx, original_category_id=gt_cid,
+                    original_size=meta0.original_size,
+                    object_id=-1, frame_index=-1))
+            dp = copy.copy(dp)
+            dp.find_queries = list(dp.find_queries) + [extra]
+        texts = [q.query_text for q in dp.find_queries]
+        outputs, obj_ids = _forward_datapoint(model, dp, device, use_amp)
+        n = min(int(outputs['pred_logits'].shape[0]), len(texts))
+
+        # ---- stage 1: all prompts except the needle ones, full image
+        needle_idx = {}
+        for i in range(n):
+            key = _norm_prompt(texts[i])
+            if key in exclude:
+                needle_idx.setdefault(key, i)
+                continue
+            cat_id = int(dp.find_queries[i].inference_metadata.original_category_id)
+            entry = {'category_id': cat_id,
+                     'pred_logits': outputs['pred_logits'][i].detach().float().cpu(),
+                     'pred_boxes': outputs['pred_boxes'][i].detach().float().cpu(),
+                     'pred_masks': outputs['pred_masks'][i].detach().float().cpu()}
+            if 'presence_logit_dec' in outputs:
+                entry['presence_logit'] = (
+                    outputs['presence_logit_dec'][i].detach().float().cpu())
+            all_eval_units.append({'eval_id': len(all_predictions),
+                                   'src_idx': src_idx,
+                                   'category_id': cat_id,
+                                   'obj_ids': obj_ids[i],
+                                   'stage': 1})
+            all_predictions.append(entry)
+
+        # ---- peak crops from the needle-hook attention of the full image
+        src = needle_idx.get(_norm_prompt(peak_prompt))
+        if src is None:
+            src = needle_idx.get(_norm_prompt("needle holder"))
+        if src is None or not crop_specs:
+            continue
+        info = val_ds.images[val_ds.image_ids[src_idx]]
+        try:
+            pil = PILImage.open(val_ds.split_dir / info['file_name']).convert("RGB")
+        except Exception as e:
+            print(f"[WARN] two-stage: cannot open {info['file_name']}: {e}")
+            continue
+        W, H = pil.size
+
+        scores = torch.sigmoid(outputs['pred_logits'][src].float()).reshape(-1)
+        masks = torch.sigmoid(outputs['pred_masks'][src].float())
+        top = torch.argsort(scores, descending=True)[:min(top_k, len(scores))]
+        peak_boxes = []
+        for qi in top.tolist():
+            m = masks[qi]
+            py, px = np.unravel_index(int(torch.argmax(m)), m.shape)
+            cx = (px + 0.5) * W / m.shape[1]
+            cy = (py + 0.5) * H / m.shape[0]
+            side = min(crop_size, W, H)
+            x0 = int(round(min(max(cx - side / 2, 0), W - side)))
+            y0 = int(round(min(max(cy - side / 2, 0), H - side)))
+            peak_boxes.append((x0, y0, x0 + side, y0 + side))
+        union = (min(b[0] for b in peak_boxes), min(b[1] for b in peak_boxes),
+                 max(b[2] for b in peak_boxes), max(b[3] for b in peak_boxes))
+
+        # ---- stage 2: needle prompts on the crop union, remapped to full image
+        cdp = _make_inference_datapoint(
+            pil.crop(union), crop_specs, val_ds.transform,
+            resolution=val_ds.resolution, src_idx=src_idx,
+            coco_image_id=dp.find_queries[0].inference_metadata.coco_image_id,
+            orig_size=(H, W))
+        c_out, _ = _forward_datapoint(model, cdp, device, use_amp)
+        # Keep ONE stage-2 detection: the highest score across BOTH needle
+        # prompts ('needle' and 'needle hook').
+        best = None
+        for j, (text, cat_id) in enumerate(crop_specs):
+            remapped = _remap_crop_output(c_out, j, union, (W, H))
+            probs = torch.sigmoid(remapped['pred_logits'].float()).reshape(-1)
+            if len(probs) == 0:
+                continue
+            i = int(torch.argmax(probs))
+            sc = float(probs[i])
+            if best is None or sc > best[0]:
+                best = (sc, cat_id, text, remapped, i)
+
+        crop_preds = []
+        if best is not None:
+            _, cat_id, text, remapped, i = best
+            nq = int(remapped['pred_logits'].shape[0])
+            single = {k: (v[i:i + 1]
+                          if torch.is_tensor(v) and v.dim() > 0
+                          and v.shape[0] == nq else v)
+                      for k, v in remapped.items()}
+            full_idx = needle_idx.get(_norm_prompt(text))
+            all_eval_units.append({
+                'eval_id': len(all_predictions),
+                'src_idx': src_idx,
+                'category_id': int(cat_id),
+                'obj_ids': obj_ids[full_idx] if full_idx is not None else [],
+                'stage': 2})
+            crop_preds.append(single)
+            all_predictions.append(single)
+            n_crop_units += 1
+
+        # ---- GT coverage + visualization (union drawn on the full image)
+        img_id = val_ds.image_ids[src_idx]
+        gts = [a['bbox'] for a in val_ds.img_to_anns.get(img_id, [])
+               if int(a.get('category_id', -1)) == gt_cid and a.get('bbox')]
+        gt_total += len(gts)
+        gt_inside += sum(1 for x, y, w, h in gts
+                         if x >= union[0] and y >= union[1]
+                         and x + w <= union[2] and y + h <= union[3])
+        if viz_dir is not None:
+            vis = pil.copy()
+            draw = ImageDraw.Draw(vis)
+            # Peak-1 / peak-2 crop windows and their union, drawn on the
+            # original image (no crop files saved).
+            for k, box in enumerate(peak_boxes, start=1):
+                draw.rectangle(box, outline=(0, 160, 255) if k == 1 else (255, 0, 255),
+                               width=6)
+            draw.rectangle(union, outline=(255, 0, 0), width=4)
+            for x, y, w, h in gts:
+                draw.rectangle([x, y, x + w, y + h], outline=(0, 200, 80), width=4)
+
+            # Detected needles (stage-2 crop predictions, full-image coords)
+            det_boxes = []
+            for p in crop_preds:
+                probs = torch.sigmoid(p['pred_logits'].float()).reshape(-1)
+                for s, b in zip(probs.tolist(), p['pred_boxes'].tolist()):
+                    if s < 0.3:
+                        continue
+                    cx, cy, bw, bh = b
+                    det_boxes.append((s, ((cx - bw / 2) * W, (cy - bh / 2) * H,
+                                          (cx + bw / 2) * W, (cy + bh / 2) * H)))
+            for s, b in sorted(det_boxes, key=lambda t: -t[0])[:20]:
+                draw.rectangle(b, outline=(255, 140, 0), width=4)
+
+            vis.save(viz_dir /
+                     f"{Path(info['file_name']).stem}_peaks_s{scores[top[0]]:.3f}.png")
+            n_viz += 1
+
+    frac = 100.0 * gt_inside / gt_total if gt_total else 0.0
+    print(f"\n[INFO] Two-stage units: {len(all_eval_units)} total "
+          f"({n_crop_units} from crop stage)")
+    if viz_dir is not None:
+        print(f"[INFO] Crop-union visualizations saved: {n_viz} -> {viz_dir}")
+    print(f"[INFO] GT boxes of '{gt_prompt}' inside the crop union: "
+          f"{gt_inside}/{gt_total} ({frac:.2f}%)")
+    return all_predictions, all_eval_units
 
 
 def convert_predictions_to_coco_format_original_res(predictions_list, image_ids, dataset, model_resolution=288, score_threshold=0.0, merge_overlaps=True, iou_threshold=0.3, debug=False):
@@ -1734,7 +2117,10 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
              pixel_metrics=True, classification=True,
              classification_threshold=0.5, plots=True, plots_dir=None,
              cm_iou=0.5, overlays=True, overlay_classes=None,
-             overlay_dir=None, overlay_iou=0.5, cm_boxes=True):
+             overlay_dir=None, overlay_iou=0.5, cm_boxes=True,
+             peak_crops=False, peak_crop_prompt="needle hook",
+             peak_crop_size=768, peak_crop_topk=2,
+             two_stage=False):
     """Run validation with full metrics (mAP, cgF1) and SAM3 NMS
 
     Args:
@@ -1762,6 +2148,16 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         overlay_classes: Class names to draw (default: all split classes).
         overlay_dir: Output root for overlays (default: <plots_dir>/detections).
         overlay_iou: Box IoU used to match prediction <-> GT in the overlays.
+        peak_crops: If True, save a full-image visualization of the top-k peak
+            windows of `peak_crop_prompt` (no crop files are written).
+        peak_crop_prompt: Class used to find the peak windows (default: needle hook).
+        peak_crop_size: Crop side in original image pixels (default: 768).
+        peak_crop_topk: Number of top-scoring queries per image (default: 2).
+        two_stage: If True, run stage 1 on the full image with every prompt
+            except `needle`/`needle holder`, then run the `needle` prompt on the
+            union of the top-`peak_crop_topk` peak crops of the needle
+            attention. Crop detections are remapped to full-image coordinates
+            and merged with stage-1 detections before scoring.
 
     Example (with LoRA):
         validate(
@@ -1790,6 +2186,9 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
                    else plots_dir / "detections")
     if overlays:
         print(f"Detection overlays will be written to: {overlay_dir}")
+
+    # Peak-window visualizations (drawn on the original image)
+    viz_dir = plots_dir / "peak_overlays"
 
     # Build model
     print("\nBuilding SAM3 model...")
@@ -1902,74 +2301,22 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     # Use automatic mixed precision for faster inference
     use_amp = device.type == 'cuda'
 
-    with torch.no_grad():
-        for batch_idx, batch_dict in enumerate(tqdm(val_loader, desc="Validation")):
-            if num_samples and batch_idx * batch_size >= num_samples:
-                break
-
-            input_batch = batch_dict["input"]
-            input_batch = move_to_device(input_batch, device)
-
-            # Forward pass with optional AMP
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    outputs_list = model(input_batch)
-            else:
-                outputs_list = model(input_batch)
-
-            # Extract predictions
-            with SAM3Output.iteration_mode(
-                outputs_list, iter_mode=SAM3Output.IterMode.ALL_STEPS_PER_STAGE
-            ) as outputs_iter:
-                final_stage = list(outputs_iter)[-1]
-                final_outputs = final_stage[-1]
-
-                # NOTE: the leading dim of pred_logits is the number of TEXT
-                # PROMPTS (find-queries) in the batch, NOT the number of images.
-                # An image with N categories contributes N prompts here. The old
-                # code assumed one prompt per image (img_id = batch_idx*batch_size
-                # + i), which both ran past len(dataset) and mis-assigned
-                # predictions on multi-category data. Instead we read each
-                # prompt's true source image and target objects from the batch
-                # metadata/targets (same flattened order as the model output) and
-                # treat every (image, prompt) pair as its own evaluation unit.
-                num_prompts = final_outputs['pred_logits'].shape[0]
-
-                # query_processing_order=0 -> stage 0 for the image model
-                meta = input_batch.find_metadatas[0]
-                tgt = input_batch.find_targets[0]
-                src_img_ids = meta.original_image_id      # per-prompt source idx
-                src_cat_ids = meta.original_category_id   # per-prompt class id
-                num_boxes = tgt.num_boxes                 # per-prompt object count
-                obj_ids_padded = tgt.object_ids_padded    # per-prompt object ids (-1 padded)
-
-                for i in range(num_prompts):
-                    eval_id = len(all_predictions)        # unique, sequential
-                    src_idx = int(src_img_ids[i])
-                    category_id = int(src_cat_ids[i])
-                    n = int(num_boxes[i])
-                    obj_ids = [int(o) for o in obj_ids_padded[i][:n].tolist()] if n > 0 else []
-
-                    all_image_ids.append(eval_id)
-                    all_eval_units.append({
-                        'eval_id': eval_id,
-                        'src_idx': src_idx,
-                        'category_id': category_id,
-                        'obj_ids': obj_ids,
-                    })
-                    pred_entry = {
-                        'category_id': category_id,
-                        'pred_logits': final_outputs['pred_logits'][i].detach().cpu(),
-                        'pred_boxes': final_outputs['pred_boxes'][i].detach().cpu(),
-                        'pred_masks': final_outputs['pred_masks'][i].detach().cpu()
-                    }
-                    # Prompt-level presence logit, needed to compute the joint
-                    # detection score the way SAM3's official eval does.
-                    if 'presence_logit_dec' in final_outputs:
-                        pred_entry['presence_logit'] = (
-                            final_outputs['presence_logit_dec'][i].detach().cpu()
-                        )
-                    all_predictions.append(pred_entry)
+    if two_stage:
+        # Stage 1 full image (all prompts but needle/needle holder) + stage 2
+        # needle prompt on the top-k peak-union crop, merged per image.
+        with torch.no_grad():
+            all_predictions, all_eval_units = collect_two_stage_predictions(
+                model, val_ds, device, use_amp,
+                crop_size=peak_crop_size, top_k=peak_crop_topk,
+                viz_dir=viz_dir if peak_crops else None,
+                max_images=num_samples,
+            )
+        all_image_ids = [u['eval_id'] for u in all_eval_units]
+    else:
+        with torch.no_grad():
+            all_predictions, all_eval_units, all_image_ids = \
+                collect_single_stage_predictions(
+                    model, val_loader, device, use_amp, batch_size, num_samples)
 
     print(f"\nCollected predictions for {len(all_predictions)} prompt units")
 
@@ -2433,6 +2780,38 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip saving the GT/prediction overlay images"
     )
+    parser.add_argument(
+        "--peak-crops",
+        action="store_true",
+        help="Save a full-image visualization of the top-k peak windows of "
+             "--peak-crop-prompt (peak-1, peak-2, union, needle GT). No crop "
+             "files are written."
+    )
+    parser.add_argument(
+        "--peak-crop-prompt",
+        type=str,
+        default="needle hook",
+        help="Class used to find the peak windows (default: needle hook)"
+    )
+    parser.add_argument(
+        "--peak-crop-size",
+        type=int,
+        default=768,
+        help="Crop side length in original image pixels (default: 768)"
+    )
+    parser.add_argument(
+        "--peak-crop-topk",
+        type=int,
+        default=2,
+        help="Number of top-scoring queries cropped per image (default: 2)"
+    )
+    parser.add_argument(
+        "--two-stage",
+        action="store_true",
+        help="Run the full image with every prompt except needle/needle holder, "
+             "then run both needle prompts on the union of the top-k peak crops "
+             "and merge those detections back into full-image coordinates"
+    )
     args = parser.parse_args()
 
     # Validate argument combinations
@@ -2464,5 +2843,10 @@ if __name__ == "__main__":
         overlays=not args.no_overlays,
         overlay_classes=args.overlay_classes,
         overlay_dir=args.overlay_dir,
-        overlay_iou=args.overlay_iou
+        overlay_iou=args.overlay_iou,
+        peak_crops=args.peak_crops,
+        peak_crop_prompt=args.peak_crop_prompt,
+        peak_crop_size=args.peak_crop_size,
+        peak_crop_topk=args.peak_crop_topk,
+        two_stage=args.two_stage
     )
