@@ -163,7 +163,9 @@ def find_annotation_files(src, recursive=False):
 
     out = []
     for p in candidates:
-        if p.name.startswith("_") or p.name == "_descriptions.json":
+        # Skip sidecars and hidden files. "_" = our own sidecars, "._" = macOS
+        # AppleDouble resource forks (binary, not JSON) created by some exports.
+        if p.name.startswith(("_", ".")):
             continue
         if any(part.lower() in IGNORED_DIRS or part.lower().startswith("coco_format")
                for part in p.relative_to(root).parts[:-1]):
@@ -190,8 +192,14 @@ def resolve_image(json_path, data):
 
 
 def read_labelme(json_path):
-    with open(json_path, "r") as f:
-        return json.load(f)
+    # LabelMe exports are UTF-8, but the process locale is not always UTF-8, so
+    # `open()` must not fall back to the platform default codec.
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except UnicodeDecodeError:
+        with open(json_path, "r", encoding="latin-1") as f:
+            return json.load(f)
 
 
 def build_split(records, out_dir, link_mode, descriptions):
