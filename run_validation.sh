@@ -10,9 +10,13 @@ CONDA_ENV="lang2segtrack"
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
 
 CONFIG="configs/full_lora_config_custom.yaml"
-WEIGHTS="outputs/sam3_lora_surgical_instruments/frozen_vision_encode_ep10_20261113_2/best_lora_weights.pt"
-VAL_DIR="/data/dataset/sam3_train_coco/valid"
+WEIGHTS="/data/opervu/ws/sam3/SAM3_LoRA/outputs/sam3_lora_surgical_instruments/frozen_vision_encode_ep10_7k_20261118_1/best_lora_weights_merged_20261118.pt"
+VAL_DIR="/data/dataset/sponge_needle/coco_incision_glove_removed_v2/valid"
+#"/data/dataset/sam3_train_coco/valid"
+#"/data/dataset/sponge_needle/coco/valid"
 PLOTS_DIR="outputs/validation_plots"
+
+TWO_STAGE_THRESHOLD="${TWO_STAGE_THRESHOLD:-0.25}"
 
 
 CONDA_BIN=""
@@ -57,8 +61,8 @@ echo ""
   --weights "$WEIGHTS" \
   --val_data_dir "$VAL_DIR" \
   --plots-dir "$PLOTS_DIR" --no-overlays \
-  --peak-crops --peak-crop-prompt 'needle hook' --peak-crop-size 768 --peak-crop-topk 2 \
-  --two-stage \
+  # --peak-crops --peak-crop-prompt 'needle' --peak-crop-size 768 --peak-crop-topk 2 \
+  # --two-stage --two-stage-threshold "$TWO_STAGE_THRESHOLD" \
   2>&1 | tee "$LOG_FILE"
 
 echo ""
