@@ -62,13 +62,13 @@ lora:
 
 # Training settings
 training:
-  #   train 1975 imgs / 7344 anns, valid 220 imgs / 783 anns  (90.0 / 10.0)
-  #   7 classes: clamp, forceps, gauze, needle, needle_holder, scissors, sponge
   data_dir: "/data/dataset/sam3_train_coco"
+  #"/data/dataset/sponge_needle/coco_incision_glove_removed_v2" #7.1K images (4.5K frames + 2.6K needle close-ups); 5.3K needle
+  #previous: "/data/dataset/sponge_needle/coco_incision_glove_removed" #4.5K images; 2.7K needle
   #needle_only: "/data/dataset/sponge_needle/coco"
   #Original: "/data/dataset/sam3_train_coco"  # contains train/ and valid/ with _annotations.coco.json
   batch_size: 2      # 1008px images on a 32GB RTX 5090; raise to 4 if VRAM allows
-  num_workers: 4        # Increase for better data loading
+  num_workers: 0         # Increase for better data loading
 
   # Hard-negative prompts (must return nothing). Dataset categories absent from
   # an image are ALWAYS added as negatives, so confusable classes (e.g. 'crack'
@@ -143,7 +143,7 @@ training:
   gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
 
 output:
-  output_dir: "outputs/sam3_lora_surgical_instruments/frozen_vision_encode_ep10_20261113_2"
+  output_dir: "outputs/sam3_lora_surgical_instruments/frozen_vision_encode_ep10_4k_20261125_1"
   logging_dir: "logs"
   save_lora_only: true
   push_to_hub: false
