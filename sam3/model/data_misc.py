@@ -120,6 +120,13 @@ class BatchedFindTarget:
     object_ids_padded: MyTensor
     object_ids_padded__type = torch.long
 
+    # Must-not-fire regions (normalized CxCywh), padded per find query row.
+    # `neg_boxes_mask` is True for padding. These are never targets: nothing is
+    # matched to them and they are excluded from `num_boxes`.
+    neg_boxes: Optional[torch.Tensor] = None
+    neg_boxes_mask: Optional[torch.Tensor] = None
+    num_neg_boxes: Optional[torch.Tensor] = None
+
 
 @dataclass
 class BatchedInferenceMetadata:

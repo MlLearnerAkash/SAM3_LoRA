@@ -130,6 +130,11 @@ class Datapoint:
     find_queries: List[FindQueryLoaded]
     images: List[Image]
     raw_images: Optional[List[PILImage.Image]] = None
+    # Per-image must-not-fire regions (normalized CxCywh, shape (R, 4)), parallel
+    # to `images`. They are deliberately NOT Objects: they must never be matched
+    # and must never be counted in `num_boxes`; they only feed the negative-region
+    # loss term (IABCEMdetr._neg_region_loss).
+    neg_regions: Optional[List[Optional[torch.Tensor]]] = None
 
 
 class CustomCocoDetectionAPI(VisionDataset):

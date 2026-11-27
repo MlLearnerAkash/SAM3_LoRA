@@ -593,6 +593,9 @@ class Sam3Image(torch.nn.Module):
             "is_exhaustive": targets.is_exhaustive,
             "object_ids_packed": targets.object_ids,
             "object_ids_padded": targets.object_ids_padded,
+            "neg_boxes": getattr(targets, "neg_boxes", None),
+            "neg_boxes_mask": getattr(targets, "neg_boxes_mask", None),
+            "num_neg_boxes": getattr(targets, "num_neg_boxes", None),
         }
         return batched_targets
 

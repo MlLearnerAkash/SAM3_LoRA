@@ -290,6 +290,8 @@ class IABCEMdetr(LossWithWeights):
         presence_alpha=0.5,
         presence_gamma=0.0,
         pos_focal: bool = False,  # for box scores, use focal loss for positives as well
+        neg_region_iou: float = 0.10,
+        neg_region_gt_iou: float = 0.10,
     ):
         super().__init__(weight_dict, compute_aux)
         self.pos_weight = pos_weight
@@ -316,6 +318,11 @@ class IABCEMdetr(LossWithWeights):
         self.presence_alpha = presence_alpha
         self.presence_gamma = presence_gamma
         self.pos_focal = pos_focal
+        # Must-not-fire regions (targets["neg_boxes"], normalized CxCywh):
+        # a query overlapping one of them by more than `neg_region_iou`, while
+        # staying below `neg_region_gt_iou` from every real GT box, is pushed to 0.
+        self.neg_region_iou = neg_region_iou
+        self.neg_region_gt_iou = neg_region_gt_iou
 
         # Decoupled loss for detection and tracking queries
         self.apply_loss_to_det_queries_in_video_grounding = (
@@ -347,6 +354,9 @@ class IABCEMdetr(LossWithWeights):
         assert outputs["pred_logits"].shape[-1] == 1, "Incorrect predicted logits shape"
         src_logits = outputs["pred_logits"].squeeze(-1)
         prob = src_logits.sigmoid()
+
+        # Must-not-fire supervision for the box head (0 when no regions present)
+        neg_region_loss = self._neg_region_loss(outputs, targets, src_logits)
 
         with torch.no_grad():
             target_classes = torch.full(
@@ -511,8 +521,88 @@ class IABCEMdetr(LossWithWeights):
             "ce_f1": bce_f1,
             "presence_loss": presence_loss,
             "presence_dec_acc": presence_dec_acc,
+            "loss_neg_region": neg_region_loss,
         }
         return losses
+
+    def _neg_region_loss(self, outputs, targets, src_logits):
+        """gamma=0 BCE on queries that fire on a must-not-fire region.
+
+        A negative region normally only trains the presence token, because the
+        per-box CE is masked out (`keep_loss`) on zero-GT query rows. This term
+        hands the *box* head the same message with no focal ``(1-p)**2`` damping
+        and normalises per region instead of over all 200 queries, so a box
+        parked on something that must never fire is actually pushed to 0.
+
+        A query is penalised when it overlaps a region by more than
+        ``neg_region_iou`` while staying below ``neg_region_gt_iou`` from every
+        real GT box, so a genuine detection sitting on a region is never
+        punished.
+        """
+        zero = src_logits.sum() * 0.0
+        if not isinstance(targets, dict):
+            return zero
+        neg_boxes = targets.get("neg_boxes", None)
+        neg_mask = targets.get("neg_boxes_mask", None)
+        num_neg = targets.get("num_neg_boxes", None)
+        pred_xyxy = outputs.get("pred_boxes_xyxy", None)
+        if neg_boxes is None or neg_boxes.numel() == 0:
+            return zero
+        if num_neg is None or pred_xyxy is None:
+            return zero
+
+        def _iou(a, b):
+            # a: (N, Q, 4), b: (N, R, 4) -> (N, Q, R)
+            a = a.unsqueeze(2)
+            b = b.unsqueeze(1)
+            ix1 = torch.maximum(a[..., 0], b[..., 0])
+            iy1 = torch.maximum(a[..., 1], b[..., 1])
+            ix2 = torch.minimum(a[..., 2], b[..., 2])
+            iy2 = torch.minimum(a[..., 3], b[..., 3])
+            inter = (ix2 - ix1).clamp(min=0) * (iy2 - iy1).clamp(min=0)
+            area_a = (a[..., 2] - a[..., 0]).clamp(min=0) * (
+                a[..., 3] - a[..., 1]
+            ).clamp(min=0)
+            area_b = (b[..., 2] - b[..., 0]).clamp(min=0) * (
+                b[..., 3] - b[..., 1]
+            ).clamp(min=0)
+            return inter / (area_a + area_b - inter).clamp(min=1e-6)
+
+        n = min(pred_xyxy.shape[0], neg_boxes.shape[0])
+        if n == 0:
+            return zero
+        pred_xyxy = pred_xyxy[:n]
+        neg_xyxy = box_ops.box_cxcywh_to_xyxy(neg_boxes[:n].clamp(0.0, 1.0))
+        if neg_mask is None:
+            valid = torch.ones(
+                neg_xyxy.shape[:2], dtype=pred_xyxy.dtype, device=pred_xyxy.device
+            )
+        else:
+            valid = (~neg_mask[:n]).to(pred_xyxy.dtype)
+        # best overlap of each query with any must-not-fire region
+        hit = (_iou(pred_xyxy, neg_xyxy) * valid.unsqueeze(1)).amax(dim=-1)
+
+        # never punish boxes that are real detections
+        gt_boxes = targets.get("boxes_padded", None)
+        if gt_boxes is not None and gt_boxes.numel() > 0:
+            gt_padded = gt_boxes[:n]
+            obj_ids = targets.get("object_ids_padded", None)
+            gt_valid = (gt_padded[..., 2] > 0) & (gt_padded[..., 3] > 0)
+            if obj_ids is not None:
+                gt_valid = gt_valid & (obj_ids[:n] >= 0)
+            gt_xyxy = box_ops.box_cxcywh_to_xyxy(gt_padded.clamp(0.0, 1.0))
+            gt_iou = (_iou(pred_xyxy, gt_xyxy)
+                      * gt_valid.to(pred_xyxy.dtype).unsqueeze(1)).amax(dim=-1)
+            hit = hit * (gt_iou < self.neg_region_gt_iou).to(hit.dtype)
+
+        selected = hit > self.neg_region_iou
+        if not bool(selected.any()):
+            return zero
+        bce = F.binary_cross_entropy_with_logits(
+            src_logits[:n], torch.zeros_like(src_logits[:n]), reduction="none"
+        )
+        denom = num_neg[:n].clamp(min=1).to(bce.dtype).sum()
+        return (bce * selected.to(bce.dtype)).sum() / denom
 
 
 class Boxes(LossWithWeights):

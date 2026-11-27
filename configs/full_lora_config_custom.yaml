@@ -81,6 +81,18 @@ training:
   #   (Pool entries sharing a word with a dataset category are auto-removed.)
 
   # ---------------------------------------------------------------------
+  # Must-not-fire REGIONS (box-level negatives)
+  # ---------------------------------------------------------------------
+  # Text negatives only ever move the per-prompt presence scalar. To tell the
+  # box head "never fire here", annotate the region with category_id 0 (or
+  # "is_negative_region": true). Such annotations are never turned into Objects:
+  # they are not matched, not counted in num_boxes, and only feed
+  # IABCEMdetr.loss_neg_region (gamma=0 BCE, normalised per region).
+  neg_region_weight: 20.0    # weight of loss_neg_region (0 disables it)
+  neg_region_iou: 0.10       # query box must overlap a region by this much
+  neg_region_gt_iou: 0.10    # ...and stay this far from every real GT box
+
+  # ---------------------------------------------------------------------
   # Data format and text prompts
   # ---------------------------------------------------------------------
   # "coco" (default) reads <data_dir>/<split>/_annotations.coco.json.

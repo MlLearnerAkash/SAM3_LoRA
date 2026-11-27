@@ -193,6 +193,8 @@ def collate_fn_api(
 
     offset_img_id = 0
     offset_query_id = [0 for _ in range(num_stages)]
+    # Must-not-fire regions, one list per stage, parallel to the find queries
+    neg_regions_per_query = [[] for _ in range(num_stages)]
     for i, data in enumerate(batch):
         img_batch.extend([img.data for img in data.images])
 
@@ -300,6 +302,18 @@ def collate_fn_api(
             if q.semantic_target is not None:
                 find_targets[stage_id].semantic_segments.append(q.semantic_target)
 
+            # Negative regions belong to the IMAGE, but the loss needs them per
+            # query row (one prompt may have regions, another may not). They are
+            # never added as targets, so nothing can be matched to them.
+            neg = None
+            if getattr(data, "neg_regions", None) is not None:
+                neg = data.neg_regions[q.image_id]
+            if neg is None or len(neg) == 0:
+                neg = torch.zeros(0, 4)
+            else:
+                neg = neg.reshape(-1, 4).float()
+            neg_regions_per_query[stage_id].append(neg)
+
         offset_img_id += len(data.images)
 
     # Pad input points to equal sequence lengths
@@ -337,6 +351,22 @@ def collate_fn_api(
         find_targets[i].object_ids_padded = packed_to_padded_naive(
             find_targets[i].object_ids, find_targets[i].num_boxes, fill_value=-1
         )
+
+    # Pad the negative regions: (rows, R, 4) + padding mask + per-row counts
+    for i in range(len(stages)):
+        rows = neg_regions_per_query[i]
+        counts = torch.as_tensor([int(t.shape[0]) for t in rows], dtype=torch.long)
+        r_max = int(counts.max().item()) if len(rows) and counts.numel() else 0
+        neg_boxes = torch.zeros(len(rows), r_max, 4, dtype=torch.float)
+        neg_mask = torch.ones(len(rows), r_max, dtype=torch.bool)  # True = padding
+        for r, t in enumerate(rows):
+            n = int(t.shape[0])
+            if n:
+                neg_boxes[r, :n] = t
+                neg_mask[r, :n] = False
+        find_targets[i].neg_boxes = neg_boxes
+        find_targets[i].neg_boxes_mask = neg_mask
+        find_targets[i].num_neg_boxes = counts
 
     # Finalize the image batch
     # check sizes

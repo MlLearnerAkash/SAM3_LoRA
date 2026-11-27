@@ -209,13 +209,43 @@ class COCOSegmentDataset(Dataset):
         self.images = {img['id']: img for img in self.coco_data['images']}
         self.image_ids = sorted(list(self.images.keys()))
 
-        # Build index: image_id -> list of annotations
+        # Build index: image_id -> list of annotations.
+        # Annotations with category_id 0 (or is_negative_region: true) are
+        # must-not-fire boxes: they are kept OUT of `img_to_anns` so they can
+        # never become an Object (never matched, num_boxes stays 0), and are
+        # collected into `neg_regions` for IABCEMdetr._neg_region_loss instead.
         self.img_to_anns = {}
+        self.neg_regions = {}
         for ann in self.coco_data['annotations']:
             img_id = ann['image_id']
+            if ann.get('category_id', 0) == 0 or ann.get('is_negative_region', False):
+                self.neg_regions.setdefault(img_id, []).append(ann)
+                continue
             if img_id not in self.img_to_anns:
                 self.img_to_anns[img_id] = []
             self.img_to_anns[img_id].append(ann)
+
+        # Must-not-fire regions as normalized CxCywh tensors (resolution agnostic)
+        for img_id, neg_anns in list(self.neg_regions.items()):
+            info = self.images.get(img_id)
+            img_w = (info or {}).get('width') or 1008
+            img_h = (info or {}).get('height') or 1008
+            boxes = []
+            for ann in neg_anns:
+                bb = ann.get('bbox')
+                if not bb or len(bb) != 4:
+                    continue
+                x, y, w, h = bb
+                boxes.append([
+                    (x + w / 2.0) / img_w,
+                    (y + h / 2.0) / img_h,
+                    w / img_w,
+                    h / img_h,
+                ])
+            if boxes:
+                self.neg_regions[img_id] = torch.tensor(boxes, dtype=torch.float32)
+            else:
+                self.neg_regions.pop(img_id)
 
         # Load categories. `categories` stays id -> name for existing callers;
         # `category_defs` keeps the full dicts so per-class descriptions survive.
@@ -229,16 +259,20 @@ class COCOSegmentDataset(Dataset):
 
         # Categories that actually have annotations (skips e.g. Roboflow's
         # unused background/supercategory entry).
-        used_cat_ids = {ann['category_id'] for ann in self.coco_data['annotations']}
+        used_cat_ids = {ann['category_id']
+                        for anns in self.img_to_anns.values() for ann in anns}
         self.used_category_names = sorted(
             {self.categories[cid].lower() for cid in used_cat_ids if cid in self.categories}
         )
 
         # Resolve the prompt text for every annotation once, up front: the
         # corpus of resolved texts is what in-domain negatives are drawn from.
+        # Must-not-fire boxes are excluded so 'object' never enters the corpus.
         self.ann_prompts = {
             ann.get('id', idx): self._resolve_prompt(ann)
             for idx, ann in enumerate(self.coco_data['annotations'])
+            if not (ann.get('category_id', 0) == 0
+                    or ann.get('is_negative_region', False))
         }
         self.prompt_corpus = sorted({p.lower() for p in self.ann_prompts.values()})
         if self.mix_class_prompt:
@@ -264,6 +298,10 @@ class COCOSegmentDataset(Dataset):
         print(f"  Prompt source: {self.prompt_source}"
               f"{' (descriptions found)' if self.uses_descriptions else ' (class names)'}")
         print(f"  Distinct prompts: {len(self.prompt_corpus)}")
+        if self.neg_regions:
+            n_boxes = sum(len(v) for v in self.neg_regions.values())
+            print(f"  Must-not-fire regions: {len(self.neg_regions)} images, "
+                  f"{n_boxes} boxes (category_id 0, never matched)")
         if self.mix_class_prompt:
             print("  Also training the plain class-name prompt per image")
         if len(self.prompt_corpus) > MAX_ALWAYS_NEGATIVES:
@@ -456,6 +494,10 @@ class COCOSegmentDataset(Dataset):
                 make_query(query_text, obj_ids, img_id, orig_h, orig_w)
                 for query_text, obj_ids in class_to_object_ids.items()
             ]
+        elif len(self.neg_regions.get(img_id, ())) > 0:
+            # Pure must-not-fire crop: its only job is to suppress the class
+            # prompts below, so an unrelated 'object' query is not emitted.
+            queries = []
         else:
             # No annotations: create a single generic query
             queries = [make_query("object", [], img_id, orig_h, orig_w)]
@@ -482,7 +524,8 @@ class COCOSegmentDataset(Dataset):
         return Datapoint(
             find_queries=queries,
             images=[image_obj],
-            raw_images=[pil_image]
+            raw_images=[pil_image],
+            neg_regions=[self.neg_regions.get(img_id, None)],
         )
 
 
@@ -1073,6 +1116,12 @@ class SAM3TrainerNative:
 
         # Create loss functions with correct weights (from original SAM3 training config)
         # Note: These weights are for mask-based training
+        training_cfg = self.config.get("training", {})
+        neg_region_weight = float(training_cfg.get("neg_region_weight", 20.0))
+        neg_region_iou = float(training_cfg.get("neg_region_iou", 0.10))
+        neg_region_gt_iou = float(training_cfg.get("neg_region_gt_iou", 0.10))
+        print_rank0(f"Negative-region loss: weight={neg_region_weight}, "
+                    f"region_iou>{neg_region_iou}, gt_iou<{neg_region_gt_iou}")
         loss_fns = [
             Boxes(weight_dict={
                 "loss_bbox": 5.0,
@@ -1082,13 +1131,16 @@ class SAM3TrainerNative:
                 pos_weight=10.0,
                 weight_dict={
                     "loss_ce": 20.0,
-                    "presence_loss": 20.0
+                    "presence_loss": 20.0,
+                    "loss_neg_region": neg_region_weight,
                 },
                 pos_focal=False,
                 alpha=0.25,
                 gamma=2,
                 use_presence=True,
                 pad_n_queries=200,
+                neg_region_iou=neg_region_iou,
+                neg_region_gt_iou=neg_region_gt_iou,
             ),
             Masks(
                 weight_dict={
